@@ -233,13 +233,60 @@ class OusvSchobelZhu1998(sv.SvABC):
         return df * fwd * price
 
 
-class OusvMcCond(sv.SvABC, sv.CondMcBsmABC):
+class OusvMcABC(sv.SvABC, sv.CondMcBsmABC, abc.ABC):
+
+    model_type = "OUSV"
+    var_process = False
+
+    @abc.abstractmethod
+    def cond_states(self, vol_0, texp):
+        """
+        Final variance and integrated variance over dt given var_0
+        The integrated variance is normalized by dt
+        Args:
+            vol_0: initial volatility
+            texp: time-to-expiry
+        Returns:
+            (var_final, var_mean, vol_mean)
+        """
+        return NotImplementedError
+
+    def vol_step(self, vol_0, dt):
+        """
+        Stepping volatility according to OU process dynamics
+        Args:
+            vol_0: initial volatility
+            dt: time step
+        Returns:
+            volatility after dt
+        """
+        mr_t = self.mr * dt
+        e_mr = np.exp(-mr_t)
+        sinh = np.sinh(mr_t)
+
+        zz = self.rv_normal()
+        vol_t = self.vov * np.sqrt(e_mr * sinh / self.mr) * zz
+        vol_t += self.theta + (vol_0 - self.theta) * e_mr
+
+        return vol_t
+
+    def cond_spot_sigma(self, vol_0, texp):
+        vol_texp, var_mean, vol_mean = self.cond_states(vol_0, texp)
+
+        spot_cond = (vol_texp**2 - vol_0**2) / (2 * self.vov) - self.vov * texp / 2 \
+            - (self.mr * self.theta / self.vov) * texp * vol_mean \
+            + (self.mr / self.vov - self.rho / 2) * texp * var_mean
+        np.exp(self.rho * spot_cond, out=spot_cond)
+
+        sigma_cond = np.sqrt((1 - self.rho**2) * var_mean) / vol_0
+        return spot_cond, sigma_cond
+
+
+class OusvMcTimeStep(OusvMcABC):
     """
     OUSV model with conditional Monte-Carlo simulation
     The SDE of SV is: d sigma_t = mr (theta - sigma_t) dt + vov dB_T
     """
-
-    var_process = False
 
     def vol_paths(self, tobs):
         # 2d array of (time, path) including t=0
@@ -252,27 +299,262 @@ class OusvMcCond(sv.SvABC, sv.CondMcBsmABC):
         sigma_t = np.insert(sigma_t, 0, self.sigma, axis=0)
         return sigma_t
 
-    def cond_spot_sigma(self, texp):
-
-        rhoc = np.sqrt(1.0 - self.rho ** 2)
+    def cond_states_full(self, sig_0, texp):
         tobs = self.tobs(texp)
         n_dt = len(tobs)
         sigma_paths = self.vol_paths(tobs)
-        sigma_final = sigma_paths[-1, :]
-        int_sigma = scint.simps(sigma_paths, dx=1, axis=0) / n_dt
-        int_var = scint.simps(sigma_paths ** 2, dx=1, axis=0) / n_dt
+        s_t = sigma_paths[-1, :]
+        u_t_std = scint.simps(sigma_paths, dx=1, axis=0) / n_dt
+        v_t_std = scint.simps(sigma_paths**2, dx=1, axis=0) / n_dt
 
-        spot_cond = np.exp(
-            self.rho
-            * (
-                (sigma_final ** 2 - self.sigma ** 2) / (2 * self.vov)
-                - self.vov * texp / 2
-                - self.mr * self.theta / self.vov * int_sigma
-                + (self.mr / self.vov - self.rho / 2) * int_var
-            )
-        )  # scaled by initial value
+        return s_t, v_t_std, u_t_std
 
-        # scaled by initial volatility
-        sigma_cond = rhoc * np.sqrt(int_var) / self.sigma
+    def cond_states(self, vol_0, texp):
+        tobs = self.tobs(texp)
+        n_dt = len(tobs)
+        dt = np.diff(tobs, prepend=0)
 
-        return spot_cond, sigma_cond
+        # precalculate the Simpson's rule weight
+        weight = np.ones(n_dt + 1)
+        weight[1:-1:2] = 4
+        weight[2:-1:2] = 2
+        weight /= weight.sum()
+
+        vol_t = np.full(self.n_path, vol_0)
+        mean_vol = weight[0] * vol_t
+        mean_var = weight[0] * vol_t**2
+
+        for i in range(n_dt):
+            vol_t = self.vol_step(vol_t, dt[i])
+            mean_vol += weight[i+1] * vol_t
+            mean_var += weight[i+1] * vol_t**2
+
+        return vol_t, mean_var, mean_vol
+
+
+class OusvMcChoi2023(OusvMcABC):
+
+    def set_mc_params(self, n_path=10000, dt=None, rn_seed=None, antithetic=True, n_sin=2, n_sin_max=None):
+        """
+        Set MC parameters
+        Args:
+            n_path: number of paths
+            dt: time step for Euler/Milstein steps
+            rn_seed: random number seed
+            antithetic: antithetic
+        """
+        assert n_sin % 2 == 0
+        if n_sin_max is not None:
+            assert n_sin_max % 2 == 0
+        self.n_sin = n_sin
+        self.n_sin_max = n_sin_max or n_sin
+
+        super().set_mc_params(n_path, dt, rn_seed, antithetic)
+
+    @classmethod
+    def _a2sum(cls, mr_t, ns=0, odd=None):
+        if odd == 2:  # even
+            rv = cls._a2sum(mr_t / 2) / 2**2
+        elif odd == 1:  # odd
+            rv = (mr_t / np.tanh(mr_t) - 1) / mr_t**2 - cls._a2sum(mr_t / 2) / 2**2
+        else:  # all
+            rv = (mr_t / np.tanh(mr_t) - 1) / mr_t**2
+
+        if ns == 0:
+            return rv
+
+        n_pi_2 = (np.arange(1, ns + 1) * np.pi)**2
+        a2 = 2 / (mr_t**2 + n_pi_2)
+
+        if odd == 2:  # even
+            rv -= np.sum(a2[1::2])
+        elif odd == 1:  # odd
+            rv -= np.sum(a2[::2])
+        else:  # all
+            rv -= np.sum(a2)
+        return rv
+
+    @classmethod
+    def _a2overn2sum(cls, mr_t, ns=0, odd=None):
+        if odd == 2:  # even
+            rv = cls._a2overn2sum(mr_t / 2) / 2**4
+        elif odd == 1:  # odd
+            rv = (1/3 - (mr_t / np.tanh(mr_t) - 1) / mr_t**2) / mr_t**2 - cls._a2overn2sum(mr_t / 2) / 2**4
+        else:  # all
+            rv = (1/3 - (mr_t / np.tanh(mr_t) - 1) / mr_t**2) / mr_t**2
+
+        if ns == 0:
+            return rv
+
+        n_pi_2 = (np.arange(1, ns + 1) * np.pi)**2
+        a2overn2 = 2 / n_pi_2 / (mr_t**2 + n_pi_2)
+
+        if odd == 2:  # even
+            rv -= np.sum(a2overn2[1::2])
+        elif odd == 1:  # odd
+            rv -= np.sum(a2overn2[::2])
+        else:  # all
+            rv -= np.sum(a2overn2)
+        return rv
+
+    @classmethod
+    def _a4sum(cls, mr_t, ns=0, odd=None):
+        if odd == 2:  # even
+            rv = cls._a4sum(mr_t / 2) / 2**4
+        elif odd == 1:  # odd
+            rv = (mr_t / np.tanh(mr_t) + mr_t**2 / np.sinh(mr_t)**2 - 2) / mr_t**4 - cls._a4sum(mr_t / 2) / 2**4
+        else:  # all
+            rv = (mr_t / np.tanh(mr_t) + mr_t**2 / np.sinh(mr_t)**2 - 2) / mr_t**4
+
+        if ns == 0:
+            return rv
+
+        n_pi_2 = (np.arange(1, ns + 1) * np.pi)**2
+        a4 = 4 / (mr_t**2 + n_pi_2)**2
+
+        if odd == 2:  # even
+            rv -= np.sum(a4[1::2])
+        elif odd == 1:  # odd
+            rv -= np.sum(a4[::2])
+        else:  # all
+            rv -= np.sum(a4)
+        return rv
+
+    @classmethod
+    def _a6sum(cls, mr_t, ns=0, odd=None):
+        if odd == 2:  # even
+            rv = cls._a6sum(mr_t / 2) / 2**6
+        elif odd == 1:  # odd
+            rv = (3 * mr_t / np.tanh(mr_t) + (3 + 2 * mr_t / np.tanh(mr_t)) * mr_t**2 / np.sinh(mr_t)**2 - 8) / (
+                        2 * mr_t**6) - cls._a6sum(mr_t / 2) / 2**6
+        else:  # all
+            rv = (3 * mr_t / np.tanh(mr_t) + (3 + 2 * mr_t / np.tanh(mr_t)) * mr_t**2 / np.sinh(mr_t)**2 - 8) / (
+                        2 * mr_t**6)
+
+        if ns == 0:
+            return rv
+
+        n_pi_2 = (np.arange(1, ns + 1) * np.pi)**2
+        a6 = 8 / (mr_t**2 + n_pi_2)**3
+
+        if odd == 2:  # even
+            rv -= np.sum(a6[1::2])
+        elif odd == 1:  # odd
+            rv -= np.sum(a6[::2])
+        else:  # all
+            rv -= np.sum(a6)
+        return rv
+
+    @classmethod
+    def _a6n2sum(cls, mr_t, ns=0, odd=None):
+        if odd == 2:  # even
+            rv = cls._a6n2sum(mr_t / 2) / 2**4
+        elif odd == 1:  # odd
+            rv = 2 * cls._a4sum(mr_t) - mr_t**2 * cls._a6sum(mr_t) - cls._a6n2sum(mr_t / 2) / 2**4
+        else:  # all
+            rv = 2 * cls._a4sum(mr_t) - mr_t**2 * cls._a6sum(mr_t)
+
+        if ns == 0:
+            return rv
+
+        n_pi_2 = (np.arange(1, ns + 1) * np.pi)**2
+        a6n2 = n_pi_2 * 8 / (mr_t**2 + n_pi_2)**3
+
+        if odd == 2:  # even
+            rv -= np.sum(a6n2[1::2])
+        elif odd == 1:  # odd
+            rv -= np.sum(a6n2[::2])
+        else:  # all
+            rv -= np.sum(a6n2)
+        return rv
+
+    def cond_states(self, vol_0, texp):
+        if self.dt is None:
+            vol_t, var_mean, vol_mean = self.cond_states_step(vol_0, texp)
+        else:
+            tobs = self.tobs(texp)
+            n_dt = len(tobs)
+            dt = np.diff(tobs, prepend=0)
+
+            vol_t = np.full(self.n_path, vol_0)
+            vol_mean = np.zeros(self.n_path)
+            var_mean = np.zeros(self.n_path)
+
+            for i in range(n_dt):
+                vol_t, d_v, d_u = self.cond_states_step(vol_t, dt[i], no_sin=True)
+                vol_mean += d_u*dt[i]
+                var_mean += d_v*dt[i]
+
+            vol_mean /= texp
+            var_mean /= texp
+        return vol_t, var_mean, vol_mean
+
+    def cond_states_step(self, vol_0, dt, no_sin=False):
+        if no_sin:
+            n_sin_max = n_sin = 0
+        else:
+            n_sin_max = self.n_sin_max
+            n_sin = self.n_sin
+
+        n_path = self.n_path
+        n_path_half = int(n_path//2)
+
+        mr, vov, theta = self.mr, self.vov, self.theta
+
+        # random number for (time, path,
+        zn = self.rng.standard_normal(size=(n_path_half, n_sin_max + 5))
+        zn = np.stack([zn, -zn], axis=1).reshape((n_path, n_sin_max + 5))
+
+        mr_t = mr * dt
+        e_mr = np.exp(-mr_t)
+        sinh = np.sinh(mr_t)
+        cosh = np.cosh(mr_t)
+        vovn = self.vov * np.sqrt(dt)  # normalized vov
+
+        z_0 = zn[:, 0]
+        z_g = zn[:, 1]
+        z_p = zn[:, 2]
+        z_q = zn[:, 3]
+        z_r = zn[:, 4]
+
+        sighat = vov * np.sqrt(e_mr * sinh / mr) * z_0
+
+        g_std = np.sqrt(self._a2overn2sum(mr_t, ns=n_sin, odd=1))
+        p_std = np.sqrt(self._a6n2sum(mr_t, ns=n_sin, odd=1))
+        q_std = np.sqrt(self._a6n2sum(mr_t, ns=n_sin, odd=2))  # even
+        corr = self._a4sum(mr_t, ns=n_sin, odd=1) / (g_std * p_std)
+
+        z_g = corr * z_p + np.sqrt(1 - corr**2) * z_g
+        z_g *= g_std
+        z_p *= p_std
+        z_q *= q_std
+
+        n_pi = np.pi * np.arange(1, n_sin + 1)
+        an2 = 2 / (mr_t**2 + n_pi**2)  ## Careful: an contains texp in sqrt
+        an = np.sqrt(an2)
+        an3_n_pi = an2 * an * n_pi
+
+        z_sin = zn[:, 5:n_sin + 5]
+        z_g += z_sin[:, ::2] @ (an[::2] / n_pi[::2])
+        z_p += z_sin[:, ::2] @ an3_n_pi[::2]
+        z_q += z_sin[:, 1::2] @ an3_n_pi[1::2]
+
+        UT = theta + (vol_0 - theta) * (1 - e_mr) / mr_t  # * dt
+        UT += (cosh - 1) / (mr_t * sinh) * sighat + 2 * vovn * z_g  # * dt
+
+        VT = theta * (2 * UT - theta) + (vol_0 - theta)**2 * (1 - e_mr**2) / (2 * mr_t)
+        VT += sighat * (vol_0 - theta) * (1 / sinh - e_mr / mr_t) + (vol_0 - theta) * vovn * (
+                    (1 + e_mr) * z_p + (1 - e_mr) * z_q)
+
+        ## VT: even terms
+        VT += (sinh * cosh - mr_t) / (2 * mr_t * sinh**2) * sighat**2 + sighat * vovn * (z_p - z_q)
+
+        # LN variate (even term)
+        m1 = self._a2sum(mr_t, ns=n_sin)
+        var = 2 * self._a4sum(mr_t, ns=n_sin)
+        ln_sig = np.sqrt(np.log(1 + var / m1**2))
+        VT += 0.5 * vovn**2 * (z_sin**2 @ an**2 + m1 * np.exp(ln_sig * (z_r - 0.5 * ln_sig)))
+
+        sighat += theta + (vol_0 - theta) * e_mr
+
+        return sighat, VT, UT
